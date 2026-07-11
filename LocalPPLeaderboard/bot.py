@@ -23,7 +23,7 @@ osu_client = Client.from_credentials(client_id, client_secret, redirect_url)
 bot = commands.Bot(command_prefix='!', description=description, intents=intents)
 
 ## Connect to Local Database
-users: db.UserDB = db.UserDB("mmosu.db")
+users: db.UserDB = db.UserDB("mmosu.db", osu_client=osu_client)
 scores: db.OsuScoreDB = db.OsuScoreDB("mmosu.db",osu_client=osu_client)
 
 @bot.event
