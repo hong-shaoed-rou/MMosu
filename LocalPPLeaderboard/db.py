@@ -122,6 +122,7 @@ class OsuScoreDB:
                     pp REAL NOT NULL,
                     accuracy REAL NOT NULL,
                     mods TEXT NOT NULL,
+                    miss_count INT NOT NULL,
                     
                     counting INTEGER NOT NULL CHECK(counting = 0 OR counting = 1) DEFAULT 1,
 
@@ -185,7 +186,8 @@ class OsuScoreDB:
                     score,
                     pp,
                     accuracy,
-                    counting
+                    counting,
+                    miss_count
                 FROM scores
                 ORDER BY pp DESC;
             """)
@@ -199,6 +201,7 @@ class OsuScoreDB:
                     f"beatmap_id: {row[2]}, "
                     f"beatmap: {row[3]}, "
                     f"combo: {row[4]}/{row[5]}, "
+                    f"misscount: {row[11]}, "
                     f"mods: {row[6]}, "
                     f"score: {row[7]}, "
                     f"pp: {row[8]}, "
@@ -293,47 +296,81 @@ class OsuScoreDB:
             except sqlite3.Error as error:
                 print(f"Could not add beatmap metadata: {error}")
                 return False
+            
+    def get_beatmamp_display_name(self, beatmap_id:int) -> str:
+        with sqlite3.connect(self.db_name) as connection:
+            cur = connection.cursor()
+
+            try: 
+                res = cur.execute("""SELECT artist, song_title, difficulty FROM beatmap_meta WHERE beatmap_id = ?""", (beatmap_id,)).fetchone()
+                artist, title, version = res[0], res[1], res[2]
+                return f"{artist} - {title} [{version}]"
+
+            except sqlite3.IntegrityError as Error:
+                print(f"Could not find beatmap_id or  artist, title, or difficulty for the beatmap in the database: {Error}")
+                return False
+
+    def score_exists_in_db(self, score_id:int) -> bool:
+        with sqlite3.connect(self.db_name) as connection:
+            cur = connection.cursor()
+
+            try:
+                res = cur.execute("""
+                        SELECT EXISTS(
+                            SELECT 1
+                            FROM scores
+                            WHERE score_id = ?
+                        );
+                    """, (score_id,))
+
+                ## NOTE: EXISTS is a subquery which returns 1 or 0, from which SELECT grabs
+                if res.fetchone()[0] == 1:
+                    return True
+                else:
+                    return False
+                
+            except sqlite3.IntegrityError as Error:
+                print(f"Error while checking for score: {Error}")
+                return
+
+
+
+    def _get_attribute_from_id(self, attribute:str, beatmap_id:int) -> str:
+        with sqlite3.connect(self.db_name) as connection:
+            cur = connection.cursor()
+            try: 
+                res = cur.execute("""SELECT ? FROM beatmap_meta WHERE beatmap_id = ?""",(attribute, beatmap_id)).fetchone()[0]
+                return str(res)
+
+            except sqlite3.IntegrityError as Error:
+                print(f"Could not find beatmap_id or name attributes in the database: {Error}")
+                return False
 
     def add_score(self, score_object: osu.objects.SoloScore):
-        """Retrieves score information and adds it to the database."""
-
         if score_object.beatmap_id is None:
             print("Could not add score: score has no beatmap_id.")
             return False
-        
-        if score_object.pp is None:
+        elif score_object.pp is None:
             print("Could not add score: score has no pp value.")
             return False
+        else:
+            if self.score_exists_in_db(score_object.id):
+                print("Score already submitted")
+                return False
+                
+            self.add_beatmap_to_beatmap_metadata(score_object.beatmap_id)
 
-
-        ## TO BE FIXED LATER WITH THE NEW METADATA DB
         username = score_object.user.username
-        beatmap_name = self.get_beatmap_display_name(score_object)
-        beatmap_max_combo = self.get_beatmap_max_from_id(score_object.beatmap_id)
+        beatmap_name = self.get_beatmamp_display_name(score_object.beatmap_id)
+        beatmap_max_combo = self._get_attribute_from_id("max_combo", score_object.beatmap_id)
 
-        self.add_beatmap_to_beatmap_metadata(score_object.beatmap_id)
+        miss_count = score_object.statistics.miss if score_object.statistics.miss is not None else 0
 
         with sqlite3.connect(self.db_name) as connection:
             connection.execute("PRAGMA foreign_keys = ON;")
             cur = connection.cursor()
 
             try:
-                score_id = int(score_object.id)
-
-                res = cur.execute("""
-                    SELECT EXISTS(
-                        SELECT 1
-                        FROM scores
-                        WHERE score_id = ?
-                    );
-                """, (score_id,))
-
-                already_exists = res.fetchone()[0]
-
-                if already_exists:
-                    print("score already submitted")
-                    return False
-                
                 team = cur.execute("""SELECT team FROM users WHERE osu_id = ?""", (score_object.user_id,)) .fetchone()[0]
             
                 
@@ -350,9 +387,10 @@ class OsuScoreDB:
                         pp,
                         accuracy,
                         score_id,
-                        team
+                        team,
+                        miss_count
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(user_id, beatmap_id)
                     DO UPDATE SET
                         username = excluded.username,
@@ -362,7 +400,8 @@ class OsuScoreDB:
                         mods = excluded.mods,
                         score = excluded.score,
                         pp = excluded.pp,
-                        accuracy = excluded.accuracy
+                        accuracy = excluded.accuracy,
+                        miss_count = excluded.miss_count
                     WHERE scores.pp < excluded.pp;
                 """, (
                     score_object.user_id,
@@ -376,7 +415,8 @@ class OsuScoreDB:
                     score_object.pp,
                     score_object.accuracy,
                     score_object.id,
-                    team
+                    team,
+                    miss_count
 
                 ))
 
@@ -389,12 +429,6 @@ class OsuScoreDB:
     def get_recent_score(self, user_id:int, pos=0):
         return self.client.get_user_scores(user_id, osu.UserScoreType.RECENT, include_fails=False, limit=1 + pos)
     
-    def get_beatmap_display_name(self, score_object: osu.objects.SoloScore):
-        artist = score_object.beatmapset.artist
-        title = score_object.beatmapset.title
-        version = score_object.beatmap.version
-
-        return f"{artist} - {title} [{version}]"
     
     def calculate_leaderboard_pp(self, weighting:float, max_num_scores:int, max_num_player_score:int) -> float:
         with sqlite3.connect(self.db_name) as connection:
@@ -498,12 +532,13 @@ if (__name__ == "__main__"):
     )
     # db.clear_records()
 
-    # for i, score in enumerate(top_scores, start=1):
-    #     print(f"Adding score {i}/10: {score.pp}pp on beatmap {score.beatmap_id}")
-    #     db.add_score(score)
-    #     # time.sleep(1)
+    print("going through adding scores")
+    for i, score in enumerate(top_scores, start=1):
+        print(f"Adding score {i}/10: {score.pp}pp on beatmap {score.beatmap_id}")
+        db.add_score(score)
+        # time.sleep(1)
 
-    # db.pretty_print()
+    db.pretty_print()
 
     print(db.calculate_leaderboard_pp(0.95, 10, 5))
 
