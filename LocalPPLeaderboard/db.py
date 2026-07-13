@@ -2,13 +2,15 @@ import sqlite3
 from collections import defaultdict
 import os
 import osu
+import datetime
 import time
 from dotenv import find_dotenv, load_dotenv
 
 class UserDB:
-    def __init__(self, db_name, osu_client: osu.Client):
+    def __init__(self, db_name, osu_client: osu.Client, autofill=True):
         self.db_name = db_name
         self.client = osu_client
+
 
         with sqlite3.connect(self.db_name) as connection:
             cur = connection.cursor()
@@ -97,9 +99,10 @@ class UserDB:
 
 
 class OsuScoreDB:
-    def __init__(self, db_name, osu_client: osu.Client):
+    def __init__(self, db_name, osu_client: osu.Client, autofill=True):
         self.db_name = db_name
         self.client = osu_client
+        self.autofill = autofill
 
         with sqlite3.connect(self.db_name) as connection:
             connection.execute("PRAGMA foreign_keys = ON;")
@@ -125,6 +128,7 @@ class OsuScoreDB:
                     miss_count INT NOT NULL,
                     
                     counting INTEGER NOT NULL CHECK(counting = 0 OR counting = 1) DEFAULT 1,
+                    submitted_at TEXT NOT NULL,
 
                     PRIMARY KEY (user_id, beatmap_id),
                     FOREIGN KEY (user_id) REFERENCES users(osu_id)
@@ -140,6 +144,11 @@ class OsuScoreDB:
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_score_id
                 ON scores(score_id);
                         """)
+            
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_beatmap_pp
+                ON scores (beatmap_id, pp DESC);
+            """)
 
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS beatmap_meta (
@@ -187,7 +196,8 @@ class OsuScoreDB:
                     pp,
                     accuracy,
                     counting,
-                    miss_count
+                    miss_count,
+                    submitted_at
                 FROM scores
                 ORDER BY pp DESC;
             """)
@@ -206,6 +216,7 @@ class OsuScoreDB:
                     f"score: {row[7]}, "
                     f"pp: {row[8]}, "
                     f"accuracy: {row[9]}, "
+                    f"submitted at: {row[12]}"
                     f"counting: {row[10]}\n"
                 )
             
@@ -227,6 +238,19 @@ class OsuScoreDB:
     def add_beatmap_to_beatmap_metadata(self, beatmap_id: int):
         with sqlite3.connect(self.db_name) as connection:
             cur = connection.cursor()
+
+            already_exists = cur.execute(
+                """
+                SELECT 1
+                FROM beatmap_meta
+                WHERE beatmap_id = ?
+                LIMIT 1;
+                """,
+                (beatmap_id,)
+            ).fetchone()
+
+            if already_exists is not None:
+                return True
 
             try:
                 beatmap = self.client.get_beatmap(beatmap_id)
@@ -365,14 +389,20 @@ class OsuScoreDB:
         beatmap_max_combo = self._get_attribute_from_id("max_combo", score_object.beatmap_id)
 
         miss_count = score_object.statistics.miss if score_object.statistics.miss is not None else 0
+        submitted_at = str(datetime.datetime.now())
 
         with sqlite3.connect(self.db_name) as connection:
             connection.execute("PRAGMA foreign_keys = ON;")
             cur = connection.cursor()
 
             try:
+                res = self.get_top_score_on_beatmap(score_object.beatmap_id)
+                if res is not False:
+                    f_username, f_pp, f_score_id = res
+                    if f_pp < score_object.pp:
+                        print(f"{f_username}'s score on {self.get_beatmamp_display_name(score_object.beatmap_id)} was sniped by {username}!!!")
+
                 team = cur.execute("""SELECT team FROM users WHERE osu_id = ?""", (score_object.user_id,)) .fetchone()[0]
-            
                 
                 cur.execute("""
                     INSERT INTO scores (
@@ -388,9 +418,10 @@ class OsuScoreDB:
                         accuracy,
                         score_id,
                         team,
-                        miss_count
+                        miss_count,
+                        submitted_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(user_id, beatmap_id)
                     DO UPDATE SET
                         username = excluded.username,
@@ -401,9 +432,11 @@ class OsuScoreDB:
                         score = excluded.score,
                         pp = excluded.pp,
                         accuracy = excluded.accuracy,
-                        miss_count = excluded.miss_count
+                        score_id = excluded.score_id,
+                        miss_count = excluded.miss_count,
+                        submitted_at = excluded.submitted_at
                     WHERE scores.pp < excluded.pp;
-                """, (
+                    """, (
                     score_object.user_id,
                     score_object.user.username,
                     score_object.beatmap_id,
@@ -416,9 +449,13 @@ class OsuScoreDB:
                     score_object.accuracy,
                     score_object.id,
                     team,
-                    miss_count
+                    miss_count,
+                    submitted_at
 
                 ))
+
+                if not(self.autofill):
+                    self.update_counting_on_beatmap(cur, score_object.beatmap_id)
 
                 return True
 
@@ -429,47 +466,100 @@ class OsuScoreDB:
     def get_recent_score(self, user_id:int, pos=0):
         return self.client.get_user_scores(user_id, osu.UserScoreType.RECENT, include_fails=False, limit=1 + pos)
     
-    
-    def calculate_leaderboard_pp(self, weighting:float, max_num_scores:int, max_num_player_score:int) -> float:
+    def get_top_score_on_beatmap(self, beatmap_id:int):
         with sqlite3.connect(self.db_name) as connection:
             cur = connection.cursor()
 
-            teams = cur.execute("""SELECT DISTINCT team FROM scores""").fetchall()
-            scores = {team : 0 for team in teams}
-
-            for team in teams:
-                res = cur.execute(f"""
-                    SELECT *
-                    FROM scores
-                    WHERE counting = 1 AND team = ?;""", team)
+            res = cur.execute("""SELECT username, pp, score_id 
+                        FROM scores
+                        WHERE beatmap_id = ? 
+                        ORDER BY pp DESC 
+                        LIMIT 1""", (beatmap_id,)).fetchone()
             
-                player_scores_counted = defaultdict(int)
-                counted_maps = set()
-                counted_scores = 0
-                cur_weighting = 1
+            if res is None:
+                # print(f"No score on the beatmap {beatmap_id} currently exists")
+                return False
+            
+            # print(f"The current best score on {beatmap_id} is {res[0]}'s score worth {res[1]}pp!")
+            return(res)
+    
+    
+    def calculate_leaderboard_pp(self, weighting: float, max_num_scores: int, max_num_player_score: int) -> dict[str, float]:
 
-                for row in res.fetchall():
-                    if counted_scores > max_num_scores: break
+        with sqlite3.connect(self.db_name) as connection:
+            cur = connection.cursor()
 
+            teams = [row[0] for row in cur.execute("SELECT DISTINCT team FROM scores;").fetchall()]
 
-                    user_id = row[0]
-                    beatmap_id = row[1]
-                    pp = row[9]
+            team_scores = {team: 0.0 for team in teams}
+            team_score_counts = {team: 0 for team in teams} # how many times a team has had their score added
+            team_weightings = {team: 1.0 for team in teams}
 
-                    if ((beatmap_id in counted_maps) or player_scores_counted[user_id] > max_num_player_score):
-                        continue
-                    else:
-                        counted_maps.add(beatmap_id)
-                        player_scores_counted[user_id] += 1
-                        
-                        scores[team] += pp * cur_weighting
-                        counted_scores += 1
-                        cur_weighting *= weighting
+            player_scores_counted = defaultdict(int)
+            counted_maps = set()
 
-            for key,val in scores.items():
-                print(f"team {key}: {val}pp")
+            rows = cur.execute(
+                    """
+                    SELECT
+                        user_id,
+                        beatmap_id,
+                        team,
+                        pp,
+                        submitted_at,
+                        score_id
+                    FROM scores
+                    WHERE counting = 1
+                    ORDER BY
+                        pp DESC,
+                        submitted_at ASC,
+                        score_id ASC;
+                    """
+                ).fetchall()
 
-        return 1 # need to update the bot function as out-value has changed
+            for (user_id, beatmap_id, team, pp, submitted_at, score_id) in rows:
+
+                if beatmap_id in counted_maps:
+                    continue
+
+                if player_scores_counted[user_id] >= max_num_player_score:
+                    continue
+
+                if team_score_counts[team] >= max_num_scores:
+                    continue
+
+                counted_maps.add(beatmap_id)
+                player_scores_counted[user_id] += 1
+
+                team_scores[team] += pp * team_weightings[team]
+                team_score_counts[team] += 1
+                team_weightings[team] *= weighting
+
+            for team, total_pp in team_scores.items():
+                print(f"team {team}: {total_pp}pp")
+
+            return team_scores
+
+    def update_counting_on_beatmap(self, cur:sqlite3.Connection.cursor, beatmap_id:int) -> None:
+
+            # Turns off counting for all beatmaps
+        cur.execute("""
+                UPDATE scores 
+                SET counting = 0
+                WHERE beatmap_id = ?""", (beatmap_id,))
+        
+        cur.execute("""
+                UPDATE scores
+                SET counting = 1
+                WHERE score_id = (
+                        SELECT score_id
+                        FROM scores
+                        WHERE beatmap_id = ?
+                        ORDER BY pp DESC, submitted_at ASC, score_id ASC
+                        LIMIT 1
+                    )
+        """, (beatmap_id,))
+            
+
     
     def pretty_print(self):
         print("\n==============================")
@@ -480,7 +570,7 @@ class OsuScoreDB:
             cur = connection.cursor()
 
             print("\n--- SAVED SCORES ---")
-            score_lb = cur.execute("SELECT * FROM scores;")
+            score_lb = cur.execute("SELECT * FROM scores ORDER BY pp DESC;")
             score_columns = [description[0] for description in score_lb.description]
 
             score_rows = score_lb.fetchall()
@@ -489,58 +579,118 @@ class OsuScoreDB:
                 print("No saved scores.")
             else:
                 for i, row in enumerate(score_rows, start=1):
+                    if i > 10: break
                     print(f"\nScore #{i}")
                     print("-" * 20)
 
                     for column_name, value in zip(score_columns, row):
                         print(f"{column_name}: {value}")
 
-            print("\n--- SAVED BEATMAPS ---")
-            beat_md = cur.execute("SELECT * FROM beatmap_meta;")
-            beatmap_columns = [description[0] for description in beat_md.description]
-
-            beatmap_rows = beat_md.fetchall()
-
-            if len(beatmap_rows) == 0:
-                print("No saved beatmaps.")
-            else:
-                for i, row in enumerate(beatmap_rows, start=1):
-                    print(f"\nBeatmap #{i}")
-                    print("-" * 20)
-
-                    for column_name, value in zip(beatmap_columns, row):
-                        print(f"{column_name}: {value}")
 
 
-
-if (__name__ == "__main__"):
+if __name__ == "__main__":
     dotenv_path = find_dotenv()
     load_dotenv(dotenv_path)
+
     client_id = int(os.environ["client_id"])
     client_secret = os.environ["client_secret"]
     redirect_url = "http://127.0.0.1:8080"
-    key = os.environ["DISCORD_API_KEY"]
-    osu_client = osu.Client.from_credentials(client_id, client_secret, redirect_url)
-    db = OsuScoreDB("mmosu.db", osu_client)
 
-    user_id = 11955716
-
-    top_scores = osu_client.get_user_scores(
-        user_id,
-        osu.UserScoreType.BEST,
-        limit=10
+    osu_client = osu.Client.from_credentials(
+        client_id,
+        client_secret,
+        redirect_url
     )
-    # db.clear_records()
 
-    print("going through adding scores")
-    for i, score in enumerate(top_scores, start=1):
-        print(f"Adding score {i}/10: {score.pp}pp on beatmap {score.beatmap_id}")
-        db.add_score(score)
-        # time.sleep(1)
+    db = OsuScoreDB("mmosu.db", osu_client,True)
+    udb = UserDB("mmosu.db", osu_client)
 
     db.pretty_print()
 
-    print(db.calculate_leaderboard_pp(0.95, 10, 5))
+    players = [
+    # Red team
+    (1, 7562902, "red"),           # mrekk
 
+    # Blue team
+    (2, 14715160, "blue"),         # cryshina
+    (3, 15406985, "blue"),         # Ivaxa
+    (4, 9269034, "blue"),          # Akolibed
+    (5, 10549880, "blue"),         # NINERIK
+    (6, 13108233, "blue"),         # milosz
+    (7, 11367222, "blue"),         # lifeline
+    (8, 12779141, "blue"),         # gnahus
+    (9, 4175698, "blue"),          # sytho
+    (10, 13211727, "blue"),        # NyanPotato
+    (11, 5033077, "blue"),         # Zylice
+    (12, 12137295, "blue"),        # jahkon
+    (13, 21207816, "blue"),        # bored yes
+    (14, 8251785, "blue"),         # killer2007
+    (15, 6404583, "blue"),         # PLOXARU
+    (16, 25444680, "blue"),        # androgenic / originset
+    (17, 19851850, "blue"),        # cloppit
+    (18, 11496364, "blue"),        # JappaDeKappa
+    (19, 6725771, "blue"),         # Cloudpaw
+    (20, 12834269, "blue"),        # roaz
+    ]
 
-    pass
+    db.clear_records()
+    udb.clear_records()
+
+    print("Adding users")
+
+    for discord_id, osu_id, team in players:
+        added = udb.add_user(
+            discord_id=discord_id,
+            osu_id=osu_id,
+            team=team
+        )
+
+        if added:
+            print(f"Added osu! user {osu_id} to team {team}")
+        else:
+            print(f"Could not add osu! user {osu_id}")
+
+    print("\nGoing through player scores")
+
+    total_scores_added = 0
+
+    for player_number, (_, osu_id, team) in enumerate(
+        players,
+        start=1
+    ):
+        print(
+            f"\nFetching player {player_number}/{len(players)}: "
+            f"{osu_id} ({team})"
+        )
+
+        try:
+            top_scores = osu_client.get_user_scores(
+                osu_id,
+                osu.UserScoreType.BEST,
+                limit=100,
+                mode='osu'
+            )
+        except Exception as error:
+            print(f"Could not retrieve scores for {osu_id}: {error}")
+            continue
+
+        score_count = len(top_scores)
+
+        for score_number, score in enumerate(top_scores, start=1):
+            print(
+                f"Adding score {score_number}/{score_count} "
+                f"for user {osu_id}: "
+                f"{score.pp}pp on beatmap {score.beatmap_id}"
+            )
+
+            if db.add_score(score):
+                total_scores_added += 1
+
+    print(f"\nSuccessfully added {total_scores_added} scores")
+
+    print("\n--- LEADERBOARD RESULTS ---")
+    db.calculate_leaderboard_pp(
+        weighting=0.95,
+        max_num_scores=100,
+        max_num_player_score=100
+    )
